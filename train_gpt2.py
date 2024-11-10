@@ -49,6 +49,14 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
+def bf16_add_sr(a: torch.Tensor, b: torch.Tensor, alpha: float, out: torch.Tensor):
+    out_f32 = a.float() + b.float() * alpha  # compute in FP32
+
+    # stochastic rounding logic
+    rand_16bit = torch.randint(0, 1 << 16, out.shape, device=out.device, dtype=torch.int32)
+    out_f32_bits = (out_f32.view(torch.int32) + rand_16bit) & 0xFFFF0000
+    out.copy_(out_f32_bits.view(torch.float32))
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -115,7 +123,10 @@ class Muon(torch.optim.Optimizer):
             curr_idx = 0
             for p in group['params']:
                 g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
+                if p.dtype == torch.bfloat16:
+                    torch.compile(bf16_add_sr, fullgraph=True, dynamic=False)(p.data, g, -lr, p.data)
+                else:
+                    p.data.add_(g, alpha=-lr)
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
@@ -385,9 +396,9 @@ x, y = train_loader.next_batch()
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda().bfloat16()
-for m in model.modules():
-    if isinstance(m, CastedLinear):
-        m.float()
+# for m in model.modules():
+#     if isinstance(m, CastedLinear):
+#         m.float()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
@@ -396,11 +407,11 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
-from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-enable_cudnn_sdp(True)
-enable_flash_sdp(False)
-enable_mem_efficient_sdp(False)
-enable_math_sdp(False)
+# from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+# enable_cudnn_sdp(True)
+# enable_flash_sdp(False)
+# enable_mem_efficient_sdp(False)
+# enable_math_sdp(False)
 
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
