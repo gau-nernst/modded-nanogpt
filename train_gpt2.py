@@ -15,6 +15,8 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+torch.compiler.reset()
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -49,13 +51,13 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
-def bf16_add_sr(a: torch.Tensor, b: torch.Tensor, alpha: float, out: torch.Tensor):
-    out_f32 = a.float() + b.float() * alpha  # compute in FP32
+def update_param(p: torch.Tensor, update: torch.Tensor, lr: torch.Tensor):
+    p_f32 = p.float() - lr * update.float()  # compute in FP32
 
     # stochastic rounding logic
-    rand_16bit = torch.randint(0, 1 << 16, out.shape, device=out.device, dtype=torch.int32)
-    out_f32_bits = (out_f32.view(torch.int32) + rand_16bit) & 0xFFFF0000
-    out.copy_(out_f32_bits.view(torch.float32))
+    rand_16bit = torch.randint(0, 1 << 16, p.shape, device=p.device, dtype=torch.int32)
+    p_f32_bits = (p_f32.view(torch.int32) + rand_16bit) & 0xFFFF0000
+    p.copy_(p_f32_bits.view(torch.float32))
 
 class Muon(torch.optim.Optimizer):
     """
@@ -84,6 +86,7 @@ class Muon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
                  backend='newtonschulz5', backend_steps=5):
+        lr = torch.tensor(lr)  # use tensor LR to avoid recomiles
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
@@ -124,9 +127,10 @@ class Muon(torch.optim.Optimizer):
             for p in group['params']:
                 g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
                 if p.dtype == torch.bfloat16:
-                    torch.compile(bf16_add_sr, fullgraph=True, dynamic=False)(p.data, g, -lr, p.data)
+                    torch.compile(update_param, fullgraph=True, dynamic=False)(p.data, g, lr)
                 else:
                     p.data.add_(g, alpha=-lr)
+                # p.data.add_(g, alpha=-lr)
                 curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
@@ -407,11 +411,11 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
-# from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-# enable_cudnn_sdp(True)
-# enable_flash_sdp(False)
-# enable_mem_efficient_sdp(False)
-# enable_math_sdp(False)
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+enable_cudnn_sdp(True)
+enable_flash_sdp(False)
+enable_mem_efficient_sdp(False)
+enable_math_sdp(False)
 
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
